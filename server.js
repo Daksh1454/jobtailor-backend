@@ -89,9 +89,14 @@ app.post("/api/webhook", express.raw({ type: "application/json" }), (req, res) =
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Serve success.html/cancel.html explicitly (rather than a blanket static
+// folder) so we're not accidentally exposing server.js/package.json etc.
+// over HTTP if they end up sitting in the same directory on GitHub.
+app.get("/success.html", (req, res) => res.sendFile(path.join(__dirname, "success.html")));
+app.get("/cancel.html", (req, res) => res.sendFile(path.join(__dirname, "cancel.html")));
 
 // ---------- Create a Stripe Checkout session ----------
 app.post("/api/checkout", async (req, res) => {

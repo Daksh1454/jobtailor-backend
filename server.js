@@ -218,7 +218,11 @@ app.post("/api/generate", requireActiveSubscription, async (req, res) => {
     }
 
     const data = await response.json();
-    const text = data.content?.[0]?.text?.trim() || "";
+    // Claude sometimes emits an extended-thinking block before the actual
+    // text block, so find the text block by type rather than assuming
+    // content[0] is always the answer.
+    const textBlock = data.content?.find((block) => block.type === "text");
+    const text = textBlock?.text?.trim() || "";
 
     if (!text) {
       // Log the full response so we can see stop_reason / content shape in

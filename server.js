@@ -176,8 +176,42 @@ so it is tightly tailored to that job: reorder and reweight bullet points to
 foreground the most relevant experience, mirror key terminology from the job
 description (without keyword-stuffing), and keep every fact truthful to the
 original resume — never invent experience, skills, or metrics the candidate
-did not provide. Keep the same overall length and format as the original.
-Output only the rewritten resume text, no preamble or explanation.`;
+did not provide. Keep bullets similarly concise to the original (don't pad
+length) so the result still fits comfortably on one page.
+
+The candidate's base resume is plain text extracted from a two-column PDF
+template: each work/project/education entry has an organization+location line
+followed by a role+dates line, then bullet points. Parse it back into that
+structure using standard resume conventions (locations look like "City, ST"
+or "Remote"; dates look like month/year ranges).
+
+Respond with ONLY valid JSON — no markdown code fences, no commentary before
+or after — matching exactly this schema:
+
+{
+  "name": string,
+  "contact": string,
+  "sections": [
+    {
+      "title": string,
+      "entries": [
+        {
+          "left": string or null,
+          "right": string or null,
+          "subLeft": string or null,
+          "subRight": string or null,
+          "bullets": string[]
+        }
+      ]
+    }
+  ]
+}
+
+Rules: keep every section from the source resume, in the same order, with the
+same section titles. For sections that are just grouped lines with no
+organization/role structure (e.g. a skills section), set left/right/subLeft/
+subRight to null and put each line in "bullets". Use null (not empty string)
+when a field doesn't apply. Do not add sections that weren't in the source.`;
 
 const COVER_LETTER_SYSTEM_PROMPT = `You are an expert cover letter writer.
 Given a candidate's resume and a specific job posting, write a concise,
@@ -195,6 +229,7 @@ app.post("/api/generate", requireActiveSubscription, async (req, res) => {
 
   const systemPrompt = mode === "cover-letter" ? COVER_LETTER_SYSTEM_PROMPT : RESUME_SYSTEM_PROMPT;
   const userPrompt = `JOB TITLE: ${job.title}\nCOMPANY: ${job.company}\n\nJOB DESCRIPTION:\n${job.description}\n\nBASE RESUME:\n${resume}`;
+  const maxTokens = mode === "cover-letter" ? 1500 : 4000;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -206,7 +241,7 @@ app.post("/api/generate", requireActiveSubscription, async (req, res) => {
       },
       body: JSON.stringify({
         model: "claude-sonnet-5",
-        max_tokens: 2000,
+        max_tokens: maxTokens,
         system: systemPrompt,
         messages: [{ role: "user", content: userPrompt }]
       })

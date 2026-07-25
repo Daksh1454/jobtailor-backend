@@ -19,10 +19,34 @@ const fs = require("fs");
 const path = require("path");
 const { nanoid } = require("nanoid");
 const Stripe = require("stripe");
+const rateLimit = require("express-rate-limit");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const DB_PATH = path.join(__dirname, "db.json");
+
+// ---------- Rate limiting ----------
+// Protects the single shared Claude API key from runaway loops or abuse.
+// Keyed by the caller's account (x-user-email) once authenticated, so it
+// caps each real subscriber rather than just their IP (which can change).
+const generateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 30, // generous for real use (a handful of tailored resumes/cover letters), blocks scripts/loops
+  keyGenerator: (req) => req.header("x-user-email") || req.ip,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Rate limit reached (30 generations/hour). Please wait a bit and try again." }
+});
+
+// Looser IP-based limiter on checkout creation, just to stop scripted spam
+// from opening a flood of Stripe sessions.
+const checkoutLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many checkout attempts. Please wait a few minutes and try again." }
+});
 
 // ---------- tiny file-based "database" ----------
 function readDb() {
@@ -99,7 +123,7 @@ app.get("/success.html", (req, res) => res.sendFile(path.join(__dirname, "succes
 app.get("/cancel.html", (req, res) => res.sendFile(path.join(__dirname, "cancel.html")));
 
 // ---------- Create a Stripe Checkout session ----------
-app.post("/api/checkout", async (req, res) => {
+app.post("/api/checkout", checkoutLimiter, async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "email is required" });
 
@@ -221,14 +245,14 @@ candidate's real experience to the role's actual requirements. Avoid cliches
 in the resume, and reference at least one concrete detail from the job
 description. Output only the cover letter text, no preamble or explanation.`;
 
-app.post("/api/generate", requireActiveSubscription, async (req, res) => {
+app.post("/api/generate", requireActiveSubscription, generateLimiter, async (req, res) => {
   const { resume, job, mode } = req.body;
   if (!resume || !job?.description) {
     return res.status(400).json({ error: "resume and job.description are required" });
   }
 
   const systemPrompt = mode === "cover-letter" ? COVER_LETTER_SYSTEM_PROMPT : RESUME_SYSTEM_PROMPT;
-  const userPrompt = `JOB TITLE: ${job.title}\nCOMPANY: ${job.company}\n\nJOB DESCRIPTION:\n${job.description}\n\nBASE RESUME:\n${resume}`;
+  const userPrompt = `JOB TITLE: ${job.title || "Not specified"}\nCOMPANY: ${job.company || "Not specified"}\n\nJOB DESCRIPTION:\n${job.description}\n\nBASE RESUME:\n${resume}`;
   const maxTokens = mode === "cover-letter" ? 1500 : 4000;
 
   try {

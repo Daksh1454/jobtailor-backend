@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>You're subscribed — JobTailor AI</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 480px; margin: 60px auto; padding: 0 20px; color: #1a1a2e; }
+  h1 { font-size: 22px; }
+  .card { background: #eef0fb; border-radius: 10px; padding: 20px; margin-top: 20px; }
+  .code { font-family: monospace; font-size: 18px; background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px 12px; word-break: break-all; margin: 10px 0; }
+  button { background: #e94560; color: #fff; border: none; border-radius: 6px; padding: 10px 14px; font-weight: 600; cursor: pointer; }
+  .hint { color: #555; font-size: 13px; }
+  .error { background: #ffe3e3; color: #a10000; padding: 12px; border-radius: 8px; }
+</style>
+</head>
+<body>
+  <h1>You're subscribed 🎉</h1>
+  <div id="content">Confirming your payment…</div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const sessionId = params.get("session_id");
+    const contentEl = document.getElementById("content");
+
+    async function run() {
+      if (!sessionId) {
+        contentEl.innerHTML = '<div class="error">Missing session ID. If you just paid, check your email receipt or contact support.</div>';
+        return;
+      }
+      try {
+        const res = await fetch(`/api/checkout-success?session_id=${encodeURIComponent(sessionId)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "Something went wrong.");
+
+        contentEl.innerHTML = `
+          <div class="card">
+            <p>Copy this access code into the <strong>JobTailor AI</strong> extension (Settings tab → Subscription → Activate):</p>
+            <div class="code" id="code">${data.token}</div>
+            <p class="hint">Email used: ${data.email}</p>
+            <button id="copyBtn">Copy code</button>
+          </div>
+        `;
+        document.getElementById("copyBtn").addEventListener("click", () => {
+          navigator.clipboard.writeText(data.token);
+          document.getElementById("copyBtn").textContent = "Copied!";
+        });
+      } catch (err) {
+        contentEl.innerHTML = `<div class="error">${err.message}</div>`;
+      }
+    }
+    run();
+  </script>
+</body>
+</html>

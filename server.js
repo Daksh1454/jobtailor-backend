@@ -106,7 +106,13 @@ app.post("/api/checkout", async (req, res) => {
       customer_email: email,
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
       success_url: successUrl,
-      cancel_url: process.env.CANCEL_URL
+      cancel_url: process.env.CANCEL_URL,
+      // Stripe's newer "Managed Payments" (auto merchant-of-record tax handling)
+      // is on by default for new accounts and requires a tax code on the
+      // product before it'll process anything. Disabling it here so checkout
+      // works immediately; see jobtailor-backend/README.md "Taxes" section
+      // for the proper long-term fix before going live with real customers.
+      managed_payments: { enabled: false }
     });
     res.json({ url: session.url });
   } catch (err) {

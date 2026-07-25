@@ -218,7 +218,16 @@ app.post("/api/generate", requireActiveSubscription, async (req, res) => {
     }
 
     const data = await response.json();
-    res.json({ text: data.content?.[0]?.text?.trim() || "" });
+    const text = data.content?.[0]?.text?.trim() || "";
+
+    if (!text) {
+      // Log the full response so we can see stop_reason / content shape in
+      // Render's Logs tab instead of silently sending back an empty string.
+      console.error("Empty completion from Claude:", JSON.stringify(data));
+      throw new Error(`Claude returned an empty response (stop_reason: ${data.stop_reason || "unknown"}). Try again, or shorten your resume/job description if this repeats.`);
+    }
+
+    res.json({ text });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

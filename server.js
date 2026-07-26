@@ -7,23 +7,22 @@
 //   - This server holds ONE server-side Claude key and proxies requests for
 //     any user with an active subscription.
 //
-// This is intentionally minimal (file-based storage, no real auth system)
-// so you can understand and deploy it quickly. Before scaling past early
-// users, replace db.json with a real database (Postgres/SQLite) and add
-// proper session auth instead of the email+token scheme below.
+// Subscriber records live in Postgres (see db.js) rather than a local file,
+// so they survive Render redeploys/restarts. Auth is still a simple
+// email+token scheme (not full session auth) — fine at this scale, worth
+// revisiting if you ever need multi-device login or password resets.
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const fs = require("fs");
 const path = require("path");
 const { nanoid } = require("nanoid");
 const Stripe = require("stripe");
 const rateLimit = require("express-rate-limit");
+const db = require("./db");
 
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
-const DB_PATH = path.join(__dirname, "db.json");
 
 // ---------- Rate limiting ----------
 // Protects the single shared Claude API key from runaway loops or abuse.
@@ -48,37 +47,25 @@ const checkoutLimiter = rateLimit({
   message: { error: "Too many checkout attempts. Please wait a few minutes and try again." }
 });
 
-// ---------- tiny file-based "database" ----------
-function readDb() {
-  if (!fs.existsSync(DB_PATH)) return { users: {} };
-  return JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-}
-function writeDb(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-}
-
 // Idempotent: creates a user + access token on first activation, reuses the
 // existing token on renewals so already-activated extensions keep working.
 // Shared by the webhook (source of truth for ongoing status) and the
 // checkout-success endpoint (so the success page can show a code immediately
 // instead of racing the webhook).
-function activateUser(email, stripeCustomerId) {
-  const db = readDb();
-  const existing = db.users[email];
+async function activateUser(email, stripeCustomerId) {
+  const existing = await db.getUserByEmail(email);
   const token = existing?.token || nanoid(24);
-  db.users[email] = {
-    ...(existing || {}),
+  const user = await db.upsertUser({
     email,
     token,
-    stripeCustomerId: stripeCustomerId || existing?.stripeCustomerId,
+    stripeCustomerId: stripeCustomerId || existing?.stripe_customer_id,
     subscriptionActive: true
-  };
-  writeDb(db);
-  return token;
+  });
+  return user.token;
 }
 
 // ---------- Stripe webhook needs the raw body, so register it BEFORE express.json() ----------
-app.post("/api/webhook", express.raw({ type: "application/json" }), (req, res) => {
+app.post("/api/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
@@ -87,25 +74,27 @@ app.post("/api/webhook", express.raw({ type: "application/json" }), (req, res) =
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  const db = readDb();
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-    const email = session.customer_email || session.customer_details?.email;
-    if (email) {
-      activateUser(email, session.customer);
-      console.log(`Activated subscription for ${email}`);
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      const email = session.customer_email || session.customer_details?.email;
+      if (email) {
+        await activateUser(email, session.customer);
+        console.log(`Activated subscription for ${email}`);
+      }
     }
-  }
 
-  if (event.type === "customer.subscription.deleted" || event.type === "customer.subscription.paused") {
-    const sub = event.data.object;
-    const user = Object.values(db.users).find((u) => u.stripeCustomerId === sub.customer);
-    if (user) {
-      user.subscriptionActive = false;
-      writeDb(db);
-      console.log(`Deactivated subscription for ${user.email}`);
+    if (event.type === "customer.subscription.deleted" || event.type === "customer.subscription.paused") {
+      const sub = event.data.object;
+      const user = await db.setSubscriptionActiveByStripeCustomerId(sub.customer, false);
+      if (user) console.log(`Deactivated subscription for ${user.email}`);
     }
+  } catch (err) {
+    // Stripe retries webhooks on non-2xx, so surface DB errors instead of
+    // silently swallowing them — a transient DB hiccup shouldn't permanently
+    // miss an activation/deactivation event.
+    console.error("Webhook handler error:", err);
+    return res.status(500).json({ error: "Internal error processing webhook" });
   }
 
   res.json({ received: true });
@@ -138,10 +127,10 @@ app.post("/api/checkout", checkoutLimiter, async (req, res) => {
       cancel_url: process.env.CANCEL_URL,
       // Stripe's newer "Managed Payments" (auto merchant-of-record tax handling)
       // is on by default for new accounts and requires a tax code on the
-      // product before it'll process anything. Disabling it here so checkout
-      // works immediately; see jobtailor-backend/README.md "Taxes" section
-      // for the proper long-term fix before going live with real customers.
-      managed_payments: { enabled: false }
+      // product before it'll process anything. Controlled by an env var
+      // (default off) so switching this on for live mode is a config change,
+      // not a code edit — see README's "Taxes (Managed Payments)" section.
+      managed_payments: { enabled: process.env.STRIPE_MANAGED_PAYMENTS === "true" }
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -163,7 +152,7 @@ app.get("/api/checkout-success", async (req, res) => {
       return res.status(402).json({ error: "Payment not completed yet." });
     }
     const email = session.customer_email || session.customer_details?.email;
-    const token = activateUser(email, session.customer);
+    const token = await activateUser(email, session.customer);
     res.json({ email, token });
   } catch (err) {
     console.error(err);
@@ -172,25 +161,33 @@ app.get("/api/checkout-success", async (req, res) => {
 });
 
 // ---------- Check subscription status (extension polls this after checkout) ----------
-app.get("/api/status", (req, res) => {
-  const { email, token } = req.query;
-  const db = readDb();
-  const user = db.users[email];
-  const active = !!(user && user.token === token && user.subscriptionActive);
-  res.json({ active });
+app.get("/api/status", async (req, res) => {
+  try {
+    const { email, token } = req.query;
+    const user = await db.getUserByEmail(email);
+    const active = !!(user && user.token === token && user.subscription_active);
+    res.json({ active });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't check subscription status right now." });
+  }
 });
 
 // ---------- Auth middleware for the paid endpoints ----------
-function requireActiveSubscription(req, res, next) {
-  const email = req.header("x-user-email");
-  const token = req.header("x-user-token");
-  const db = readDb();
-  const user = db.users[email];
+async function requireActiveSubscription(req, res, next) {
+  try {
+    const email = req.header("x-user-email");
+    const token = req.header("x-user-token");
+    const user = await db.getUserByEmail(email);
 
-  if (!user || user.token !== token || !user.subscriptionActive) {
-    return res.status(402).json({ error: "No active subscription. Subscribe to use JobTailor AI." });
+    if (!user || user.token !== token || !user.subscription_active) {
+      return res.status(402).json({ error: "No active subscription. Subscribe to use JobTailor AI." });
+    }
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Couldn't verify subscription right now." });
   }
-  next();
 }
 
 // ---------- Same prompts as the Phase 1 extension's background.js ----------
@@ -298,4 +295,12 @@ app.post("/api/generate", requireActiveSubscription, generateLimiter, async (req
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`JobTailor backend listening on port ${port}`));
+
+db.initDb()
+  .then(() => {
+    app.listen(port, () => console.log(`JobTailor backend listening on port ${port}`));
+  })
+  .catch((err) => {
+    console.error("Failed to initialize the database. Check DATABASE_URL.", err);
+    process.exit(1);
+  });

@@ -24,6 +24,10 @@ const db = require("./db");
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 
+// Free trial length in days before the first charge. Defaults to 5 if
+// STRIPE_TRIAL_DAYS isn't set; set it to 0 to disable the trial entirely.
+const TRIAL_DAYS = process.env.STRIPE_TRIAL_DAYS !== undefined ? parseInt(process.env.STRIPE_TRIAL_DAYS, 10) || 0 : 5;
+
 // ---------- Rate limiting ----------
 // Protects the single shared Claude API key from runaway loops or abuse.
 // Keyed by the caller's account (x-user-email) once authenticated, so it
@@ -125,6 +129,13 @@ app.post("/api/checkout", checkoutLimiter, async (req, res) => {
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
       success_url: successUrl,
       cancel_url: process.env.CANCEL_URL,
+      // Free trial before the first charge, to lower the barrier to try the
+      // product. Card is still collected at checkout (Stripe requires this
+      // for subscription-mode Checkout Sessions), so this isn't a card-less
+      // trial — it just delays the first charge, and cancelling before the
+      // trial ends means never being charged. Length is configurable via env
+      // var so it can be tuned without a code change; unset/0 disables it.
+      ...(TRIAL_DAYS > 0 ? { subscription_data: { trial_period_days: TRIAL_DAYS } } : {}),
       // Stripe's newer "Managed Payments" (auto merchant-of-record tax handling)
       // is on by default for new accounts and requires a tax code on the
       // product before it'll process anything. Controlled by an env var
@@ -148,7 +159,12 @@ app.get("/api/checkout-success", async (req, res) => {
 
   try {
     const session = await stripe.checkout.sessions.retrieve(session_id);
-    if (session.payment_status !== "paid") {
+    // A checkout with a free trial completes with payment_status
+    // "no_payment_required" (nothing is actually charged yet) rather than
+    // "paid" — both mean checkout succeeded and the subscription is real,
+    // just at different billing states. Only "unpaid" is a real failure.
+    const validStatuses = ["paid", "no_payment_required"];
+    if (!validStatuses.includes(session.payment_status)) {
       return res.status(402).json({ error: "Payment not completed yet." });
     }
     const email = session.customer_email || session.customer_details?.email;
